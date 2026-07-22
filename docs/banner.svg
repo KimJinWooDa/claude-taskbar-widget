@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1720" height="520" viewBox="0 0 1720 520">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#111B28"/>
+      <stop offset="100%" stop-color="#162435"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F4EBDD"/>
+      <stop offset="100%" stop-color="#F1E6D7"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1720" height="520" rx="28" fill="url(#bg)"/>
+
+  <text x="860" y="128" text-anchor="middle"
+        fill="#F3F6FB" font-size="66" font-family="Arial, sans-serif" font-weight="700">
+    claude-taskbar-widget
+  </text>
+
+  <text x="860" y="182" text-anchor="middle"
+        fill="#7FA0C4" font-size="30" font-family="Arial, sans-serif" letter-spacing="8">
+    YOUR CLAUDE FUEL GAUGE, ALWAYS ON THE TASKBAR
+  </text>
+
+  <rect x="440" y="218" width="840" height="154" rx="20" fill="url(#panel)" stroke="#E7DCCB"/>
+
+  <text x="492" y="282" fill="#D65D3F" font-size="46" font-family="Arial, sans-serif" font-weight="700">
+    세션 91%
+  </text>
+  <text x="688" y="282" fill="#8A97A8" font-size="46" font-family="Arial, sans-serif" font-weight="700">
+    · 4시간 8분 후
+  </text>
+
+  <text x="492" y="338" fill="#3C4E66" font-size="46" font-family="Arial, sans-serif" font-weight="700">
+    Fable 39%
+  </text>
+  <text x="734" y="338" fill="#8A97A8" font-size="46" font-family="Arial, sans-serif" font-weight="700">
+    · 10시간 18분 후
+  </text>
+
+  <rect x="520" y="418" width="290" height="58" rx="0" fill="#1177DA"/>
+  <rect x="820" y="418" width="250" height="58" rx="0" fill="#3E82C6"/>
+  <rect x="1080" y="418" width="90" height="58" rx="0" fill="#2FA84F"/>
+
+  <text x="665" y="456" text-anchor="middle" fill="#FFFFFF" font-size="30" font-family="Arial, sans-serif" font-weight="700">
+    WINDOWS 10/11
+  </text>
+  <text x="945" y="456" text-anchor="middle" fill="#FFFFFF" font-size="30" font-family="Arial, sans-serif" font-weight="700">
+    PYTHON 3.10+
+  </text>
+  <text x="1125" y="456" text-anchor="middle" fill="#FFFFFF" font-size="30" font-family="Arial, sans-serif" font-weight="700">
+    MIT
+  </text>
+</svg>
