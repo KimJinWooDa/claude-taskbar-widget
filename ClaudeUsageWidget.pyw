@@ -41,6 +41,8 @@ SINGLETON_PORT = 53917
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", HOME), APP_NAME)
 LOG_PATH = os.path.join(APPDATA_DIR, "widget.log")
 CONFIG_PATH = os.path.join(APPDATA_DIR, "config.json")
+CACHE_PATH = os.path.join(APPDATA_DIR, "last-usage.json")
+CACHE_MAX_AGE = 24 * 3600
 STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""),
                            r"Microsoft\Windows\Start Menu\Programs\Startup")
 STARTUP_VBS = os.path.join(STARTUP_DIR, "ClaudeUsageWidget.vbs")
@@ -184,12 +186,35 @@ def rows_from_windows(d):
     return rows
 
 
+def clipboard_text():
+    """클립보드의 유니코드 텍스트 — 장수 토큰 등록용."""
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    u.GetClipboardData.restype = ctypes.c_void_p
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalLock.argtypes = [ctypes.c_void_p]
+    k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    if not u.OpenClipboard(0):
+        return ""
+    try:
+        h = u.GetClipboardData(13)      # CF_UNICODETEXT
+        p = k.GlobalLock(h) if h else None
+        try:
+            return ctypes.wstring_at(p) if p else ""
+        finally:
+            if p:
+                k.GlobalUnlock(h)
+    finally:
+        u.CloseClipboard()
+
+
 # ---------------------------------------------------------------- API
 class ApiDenied(Exception):
     pass
 
 
 _refresh_lock = threading.Lock()
+_tok_sig = None
 
 
 def get_access_token(force_refresh=False):
@@ -201,11 +226,24 @@ def get_access_token(force_refresh=False):
             raise ApiDenied(f"인증 파일 없음: {e}")
         oauth = creds.get("claudeAiOauth") or {}
         token = oauth.get("accessToken")
+        global _tok_sig
+        sig = ((token or "")[:11], oauth.get("expiresAt"))
+        if sig != _tok_sig:        # 토큰 종류·만료 진단용 — 값 자체는 남기지 않는다
+            _tok_sig = sig
+            exp = oauth.get("expiresAt")
+            try:
+                when = datetime.datetime.fromtimestamp(
+                    exp / 1000).isoformat(" ", "minutes") if exp else "?"
+            except (TypeError, ValueError, OSError, OverflowError):
+                when = str(exp)
+            log.info("cred token %s... expires %s", (token or "")[:11], when)
         if not force_refresh and token and \
                 oauth.get("expiresAt", 0) > time.time() * 1000 + 120_000:
             return token
         rt = oauth.get("refreshToken")
         if not rt:
+            if token and not force_refresh:
+                return token    # 갱신은 못 해도 저장된 토큰이 살아있을 수 있다
             raise ApiDenied("리프레시 토큰 없음")
         req = urllib.request.Request(
             TOKEN_URL,
@@ -223,6 +261,9 @@ def get_access_token(force_refresh=False):
             except Exception:
                 pass
             log.info("token refresh body: %s", body)
+            if token and not force_refresh:
+                log.info("refresh failed - trying stored token anyway")
+                return token    # 만료 표기가 틀린 장수 토큰일 수 있다
             raise ApiDenied(f"토큰 갱신 실패 HTTP {e.code}")
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
@@ -245,6 +286,21 @@ def get_access_token(force_refresh=False):
 
 
 def fetch_usage_api():
+    # 장수 토큰(claude setup-token, 12개월)이 등록돼 있으면 그것만 쓴다 —
+    # 갱신이 필요 없어 .credentials.json의 1회용 리프레시 토큰 문제를 피한다.
+    setup_tok = load_config().get("setup_token")
+    if setup_tok:
+        req = urllib.request.Request(
+            API_URL, headers={"Authorization": f"Bearer {setup_tok}", **API_HEADERS})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise ApiDenied("설정 토큰 거부 — claude setup-token 재발급 필요")
+            raise RuntimeError(f"HTTP {e.code}")
+        except OSError as e:
+            raise RuntimeError(f"네트워크: {e}")
     for attempt in (0, 1):
         token = get_access_token(force_refresh=(attempt == 1))
         req = urllib.request.Request(
@@ -654,8 +710,11 @@ class FloatingBar(threading.Thread):
         if self._ticks % 15 == 0:
             self._match_background()
         sess, second, name2 = self._pick()
+        notice = self.app.auth_notice
         for idx, (title, row) in enumerate((("세션", sess), (name2, second))):
-            if row:
+            if idx == 1 and notice:     # 둘째 줄을 재발급 안내로 대체
+                self._set_line(1, "", notice, "", "#da3633")
+            elif row:
                 pct, reset = row
                 t = short_reset(reset)
                 self._set_line(idx, f"{title} ", f"{round(pct)}%",
@@ -708,10 +767,13 @@ class TrayApp:
         self.source = None      # "api" | "hook"
         self.updated_at = None
         self.status = "불러오는 중…"
+        self.auth_notice = None     # 토큰 만료 시 플로팅 바에 띄울 문구
         self.icon = None
         self.cfg = load_config()
 
         self._load_file(initial=True)   # 켜자마자 마지막 값 표시
+        if not self.rows:
+            self._load_cache()          # 훅 데이터가 없으면 지난 실행의 API 값
 
     # ---------------- 데이터
     def _load_file(self, initial=False):
@@ -732,6 +794,46 @@ class TrayApp:
             self.rows, self.source, self.updated_at = rows, "hook", ts
             self.status = None
         return (rows, ts)
+
+    def _load_cache(self):
+        try:
+            with open(CACHE_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+            rows = [(r[0], float(r[1]), r[2]) for r in d["rows"]]
+            ts = float(d["updated_at"])
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            return
+        if rows and time.time() - ts < CACHE_MAX_AGE:
+            self.rows, self.source, self.updated_at = rows, "cache", ts
+            self.status = None
+
+    def _adopt_setup_token(self):
+        """credentials에 장수 토큰(sk-ant-oat…)이 보이면 위젯 설정에 자동 등록.
+
+        claude setup-token이 토큰을 화면에 안 보여주고 파일에만 저장하므로,
+        수동 복사 없이 위젯이 스스로 집어간다. 등록 후엔 갱신이 필요 없다.
+        """
+        try:
+            with open(CRED_PATH, encoding="utf-8") as f:
+                tok = ((json.load(f).get("claudeAiOauth") or {})
+                       .get("accessToken")) or ""
+        except (OSError, json.JSONDecodeError):
+            return False
+        if tok.startswith("sk-ant-oat") and tok != self.cfg.get("setup_token"):
+            self.cfg["setup_token"] = tok
+            save_config(self.cfg)
+            log.info("setup token auto-registered (len %d)", len(tok))
+            return True
+        return False
+
+    def _save_cache(self):
+        try:
+            tmp = CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"rows": self.rows, "updated_at": self.updated_at}, f)
+            os.replace(tmp, CACHE_PATH)
+        except OSError:
+            pass
 
     def _poll_loop(self):
         last_mtime = None
@@ -772,15 +874,31 @@ class TrayApp:
                         if rows:
                             self.q.put(("data", rows, "api", now))
                             api_denied_reason = None
+                            if self.auth_notice:
+                                self.auth_notice = None
+                                log.info("auth notice cleared")
                             if not api_ok:
                                 api_ok = True
                                 log.info("api ok: %d rows", len(rows))
+                            if not self.cfg.get("setup_token"):
+                                self._adopt_setup_token()
                         next_api = now + API_INTERVAL_OK
                     except ApiDenied as e:
                         api_denied_reason = str(e)
                         api_ok = False
                         next_api = now + API_INTERVAL_DENIED
                         log.info("api denied: %s", e)
+                        if "설정 토큰" in api_denied_reason and \
+                                self._adopt_setup_token():
+                            next_api = 0.0  # 새로 발급된 장수 토큰으로 즉시 재시도
+                        elif ("설정 토큰" in api_denied_reason
+                              or "토큰 갱신" in api_denied_reason
+                              or "인증" in api_denied_reason):
+                            n = "토큰 만료 · claude setup-token 실행"
+                            if n != self.auth_notice:
+                                self.auth_notice = n
+                                log.info("auth notice: %s", n)
+                        # 조직 정책 등 재발급으로 못 푸는 경우는 문구 없음
                     except Exception as e:
                         api_ok = False
                         next_api = now + API_INTERVAL_OK
@@ -797,8 +915,15 @@ class TrayApp:
                         self.q.put(("data", got[0], "hook", got[1]))
 
                 if not self.rows:
-                    self.q.put(("status", "대기 중 — 훅 설정 확인 필요"
-                                if api_denied_reason else "불러오는 중…"))
+                    if api_denied_reason and "설정 토큰" in api_denied_reason:
+                        st = "설정 토큰 재발급 필요 — claude setup-token"
+                    elif api_denied_reason and "토큰 갱신" in api_denied_reason:
+                        st = "재로그인 필요 — 터미널에서 claude /login"
+                    elif api_denied_reason:
+                        st = "대기 중 — 훅 설정 확인 필요"
+                    else:
+                        st = "불러오는 중…"
+                    self.q.put(("status", st))
             except Exception:
                 log.exception("poll error")
             self.wake.wait(POLL_SEC)
@@ -818,7 +943,8 @@ class TrayApp:
             if self.updated_at:
                 age = time.time() - self.updated_at
                 when = time.strftime("%H:%M", time.localtime(self.updated_at))
-                src = "실시간" if self.source == "api" else "마지막 대화 시점"
+                src = {"api": "실시간", "cache": "지난 실행 값"}.get(
+                    self.source, "마지막 대화 시점")
                 stale = "" if age < 90 else f" ({int(age // 60)}분 전)"
                 items.append(pystray.MenuItem(f"— {src} · {when}{stale}",
                                               None, enabled=False))
@@ -833,6 +959,9 @@ class TrayApp:
             *self._menu_lines(),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
+            pystray.MenuItem("장수 토큰 등록 (클립보드에서)",
+                             lambda i, it: self.q.put(("token",)),
+                             checked=lambda it: bool(self.cfg.get("setup_token"))),
             pystray.MenuItem("플로팅 바 표시",
                              lambda i, it: self.q.put(("bar",)),
                              checked=lambda it: self.cfg.get("bar_visible", True)),
@@ -892,6 +1021,8 @@ class TrayApp:
             if kind == "data":
                 self.rows, self.source, self.updated_at = msg[1], msg[2], msg[3]
                 self.status = None
+                if self.source == "api":
+                    self._save_cache()
                 self._refresh_tray()
             elif kind == "status":
                 if not self.rows:
@@ -900,6 +1031,24 @@ class TrayApp:
             elif kind == "refresh":
                 self.force_api.set()
                 self.wake.set()
+            elif kind == "token":
+                tok = ""
+                try:
+                    tok = clipboard_text().strip()
+                except Exception as e:
+                    log.error("clipboard read failed: %s", e)
+                if tok.startswith("sk-ant-"):
+                    self.cfg["setup_token"] = tok
+                    save_config(self.cfg)
+                    log.info("setup token registered (len %d)", len(tok))
+                    self.force_api.set()
+                    self.wake.set()
+                    self.icon.notify("장수 토큰 등록됨 — 사용량 조회 재시도",
+                                     "Claude 사용량")
+                else:
+                    self.icon.notify("클립보드에 sk-ant- 로 시작하는 토큰이 없습니다. "
+                                     "claude setup-token 결과를 복사한 뒤 다시 눌러주세요.",
+                                     "Claude 사용량")
             elif kind == "bar":
                 self.cfg["bar_visible"] = not self.cfg.get("bar_visible", True)
                 save_config(self.cfg)
