@@ -3,7 +3,22 @@
 # 3) settings.json 에 붙여넣을 훅 설정을 출력
 $ErrorActionPreference = "Stop"
 
-$repo = Split-Path -Parent $MyInvocation.MyCommand.Path
+# `irm ... | iex` 로 실행되면 스크립트 경로가 없다 — 저장소를 직접 내려받는다.
+$scriptPath = $MyInvocation.MyCommand.Path
+if ($scriptPath) { $repo = Split-Path -Parent $scriptPath } else { $repo = $null }
+if (-not $repo -or -not (Test-Path (Join-Path $repo "ClaudeUsageWidget.pyw"))) {
+    $repo = Join-Path $env:LOCALAPPDATA "claude-taskbar-widget"
+    Write-Host "[0/3] 위젯 다운로드 -> $repo"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $zip = Join-Path $env:TEMP "claude-taskbar-widget.zip"
+    Invoke-WebRequest "https://github.com/KimJinWooDa/claude-taskbar-widget/archive/refs/heads/main.zip" -OutFile $zip -UseBasicParsing
+    $tmp = Join-Path $env:TEMP ("ctw-" + [guid]::NewGuid().ToString("N"))
+    Expand-Archive $zip -DestinationPath $tmp -Force
+    if (Test-Path $repo) { Remove-Item $repo -Recurse -Force }
+    Move-Item (Join-Path $tmp "claude-taskbar-widget-main") $repo
+    Remove-Item $zip -Force
+    Remove-Item $tmp -Recurse -Force
+}
 $widget = Join-Path $repo "ClaudeUsageWidget.pyw"
 $claudeDir = Join-Path $env:USERPROFILE ".claude"
 
@@ -35,4 +50,4 @@ Write-Host "[3/3] 아래 내용을 $claudeDir\settings.json 의 hooks 에 추가
 "@ | Write-Host
 
 Write-Host ""
-Write-Host "완료. 지금 바로 켜려면: run-widget.vbs 더블클릭" -ForegroundColor Green
+Write-Host "완료. 지금 바로 켜려면: $(Join-Path $repo 'run-widget.vbs') 더블클릭" -ForegroundColor Green
