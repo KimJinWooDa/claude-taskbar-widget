@@ -13,6 +13,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import re
 import sys
 import time
 import socket
@@ -22,6 +23,8 @@ import logging
 import datetime
 import urllib.request
 import urllib.error
+
+__version__ = "2.7.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -40,6 +43,13 @@ ACTIVE_WINDOW = 300             # 최근 5분 내 전사 갱신 = 대화 중
 EVENT_MIN_GAP = 90              # 답변 직후 조회의 최소 간격
 API_INTERVAL_DENIED = 30 * 60
 SINGLETON_PORT = 53917
+
+REPO = "KimJinWooDa/claude-taskbar-widget"
+CHANGELOG_URL = f"https://raw.githubusercontent.com/{REPO}/main/CHANGELOG.md"
+CHANGELOG_PAGE = f"https://github.com/{REPO}/blob/main/CHANGELOG.md"
+REPO_ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/main.zip"
+REPO_ZIP_TOPDIR = "claude-taskbar-widget-main"
+UPDATE_CHECK_SEC = 24 * 3600
 
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", HOME), APP_NAME)
 LOG_PATH = os.path.join(APPDATA_DIR, "widget.log")
@@ -343,6 +353,58 @@ def fetch_usage_api():
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
     raise ApiDenied("인증 실패")
+
+
+# ---------------------------------------------------------------- 업데이트
+_CHANGELOG_HEAD = re.compile(r"^##\s+v?(\d+(?:\.\d+)*)\b")
+
+
+def _ver_tuple(s):
+    """'2.7.0' → (2, 7, 0). 자릿수가 달라도 비교되게 3자리로 맞춘다."""
+    try:
+        nums = [int(x) for x in str(s).split(".")]
+    except ValueError:
+        return (0, 0, 0)
+    return tuple((nums + [0, 0, 0])[:3])
+
+
+def parse_changelog(text):
+    """CHANGELOG.md → [(버전튜플, '2.7.0', 본문)] 파일 순서(최신이 먼저)."""
+    entries = []
+    for line in text.splitlines():
+        m = _CHANGELOG_HEAD.match(line.strip())
+        if m:
+            entries.append([_ver_tuple(m.group(1)), m.group(1), []])
+        elif entries and line.strip():
+            entries[-1][2].append(line.rstrip())
+    return [(t, s, "\n".join(body)) for t, s, body in entries]
+
+
+def fetch_changelog():
+    req = urllib.request.Request(CHANGELOG_URL, headers={"User-Agent": CLI_UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def download_repo(dst):
+    """저장소 zip을 받아 풀고 위젯 파일이 든 폴더 경로를 돌려준다."""
+    import io
+    import zipfile
+    req = urllib.request.Request(REPO_ZIP_URL, headers={"User-Agent": CLI_UA})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = r.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        z.extractall(dst)
+    src = os.path.join(dst, REPO_ZIP_TOPDIR)
+    if not os.path.exists(os.path.join(src, "ClaudeUsageWidget.pyw")):
+        raise RuntimeError("내려받은 압축에 위젯 파일이 없음")
+    return src
+
+
+def _msgbox(text, title, flags):
+    # MB_TOPMOST | MB_SETFOREGROUND — 트레이에서 띄우는 창이 뒤로 숨지 않게
+    return ctypes.windll.user32.MessageBoxW(0, text, title,
+                                            flags | 0x40000 | 0x10000)
 
 
 # ---------------------------------------------------------------- 자동 실행
@@ -828,6 +890,8 @@ class TrayApp:
         self.updated_at = None
         self.status = "불러오는 중…"
         self.auth_notice = None     # 토큰 만료 시 플로팅 바에 띄울 문구
+        self.update_info = None     # (새 버전 문자열, 패치노트) — 있으면 메뉴에 표시
+        self._updating = False
         self.icon = None
         self.cfg = load_config()
 
@@ -895,10 +959,95 @@ class TrayApp:
         except OSError:
             pass
 
+    # ---------------- 업데이트
+    def _check_update(self):
+        """CHANGELOG의 최신 버전이 내 버전보다 높으면 알림 + 메뉴 항목 준비."""
+        entries = parse_changelog(fetch_changelog())
+        if not entries:
+            return
+        cur = _ver_tuple(__version__)
+        if entries[0][0] <= cur:
+            self.update_info = None
+            return
+        latest = entries[0][1]
+        notes = "\n\n".join(f"v{s}\n{body}" for t, s, body in entries
+                            if t > cur)
+        self.update_info = (latest, notes)
+        log.info("update available: v%s (current v%s)", latest, __version__)
+        if self.cfg.get("notified_version") != latest:
+            self.cfg["notified_version"] = latest
+            save_config(self.cfg)
+            if self.icon:
+                self.icon.notify(f"새 버전 v{latest}가 나왔습니다 — "
+                                 "트레이 메뉴에서 설치할 수 있습니다",
+                                 "Claude 위젯 업데이트")
+                log.info("update toast shown: v%s", latest)
+
+    def _do_update(self):
+        """패치노트를 보여주고 확인하면 zip으로 교체 후 재시작. (별도 스레드)"""
+        import shutil
+        import subprocess
+        import tempfile
+        info = self.update_info
+        if not info or self._updating:
+            return
+        ver, notes = info
+        here = os.path.dirname(os.path.abspath(__file__))
+        if os.path.isdir(os.path.join(here, ".git")):
+            _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
+                    "개발 폴더(git 저장소)에서 실행 중이라 자동 설치는 하지 "
+                    "않습니다. git pull 로 업데이트하세요.",
+                    "Claude 위젯 업데이트", 0x40)      # MB_ICONINFORMATION
+            return
+        ok = _msgbox(f"v{ver} 패치노트:\n\n{notes[:1500]}\n\n"
+                     "지금 설치하고 재시작할까요?",
+                     f"Claude 위젯 업데이트 v{ver}", 0x41)  # OKCANCEL | INFO
+        if ok != 1:                                         # IDOK
+            return
+        self._updating = True
+        try:
+            src = download_repo(tempfile.mkdtemp(prefix="ctw-update-"))
+            shutil.copytree(src, here, dirs_exist_ok=True)
+            self._update_hooks(src)
+            log.info("update installed: v%s", ver)
+            vbs = os.path.join(here, "run-widget.vbs")
+            # 구 인스턴스가 싱글턴 포트를 놓은 뒤(약 3초) 새 인스턴스를 띄운다
+            subprocess.Popen(
+                f'cmd /c ping -n 4 127.0.0.1 >nul & wscript "{vbs}"',
+                creationflags=0x08000008)   # DETACHED | CREATE_NO_WINDOW
+            self.q.put(("quit",))
+        except Exception as e:
+            log.exception("update failed")
+            self._updating = False
+            _msgbox(f"업데이트 실패: {e}\n\n"
+                    "README의 설치 명령으로 다시 설치하면 해결됩니다.",
+                    "Claude 위젯 업데이트", 0x10)           # MB_ICONERROR
+
+    def _update_hooks(self, src):
+        """설치돼 있는 ~/.claude 훅 사본도 새 버전으로 갱신 (없으면 건너뜀)."""
+        import shutil
+        claude_dir = os.path.join(HOME, ".claude")
+        try:
+            tgt = os.path.join(claude_dir, "start-usage-widget.py")
+            if os.path.exists(tgt):
+                with open(os.path.join(src, "hooks", "start-usage-widget.py"),
+                          encoding="utf-8") as f:
+                    txt = f.read().replace("__WIDGET_PATH__",
+                                           os.path.abspath(__file__))
+                with open(tgt, "w", encoding="utf-8") as f:
+                    f.write(txt)
+            tgt = os.path.join(claude_dir, "usage-hook.py")
+            if os.path.exists(tgt):
+                shutil.copyfile(os.path.join(src, "hooks", "usage-hook.py"),
+                                tgt)
+        except OSError as e:
+            log.warning("hook update skipped: %s", e)
+
     def _poll_loop(self):
         last_mtime = None
         last_cred = None
         next_api = 0.0
+        next_upd = time.time() + 30     # 시작 직후 부하를 피해 30초 뒤 첫 확인
         throttle_until = 0.0
         throttle_streak = 0
         last_ts = None
@@ -930,6 +1079,13 @@ class TrayApp:
                     last_cred = cred
                     next_api = 0.0
                     log.info("credentials changed - retry api now")
+
+                if now >= next_upd:
+                    next_upd = now + UPDATE_CHECK_SEC
+                    try:
+                        self._check_update()
+                    except Exception as e:
+                        log.info("update check failed: %s", e)
 
                 # 전사 파일 갱신 = 방금 답변이 끝남 → 사용량이 변한 순간
                 ts_m = latest_transcript_mtime()
@@ -1052,9 +1208,14 @@ class TrayApp:
 
     def _build_menu(self):
         import pystray
+        upd = []
+        if self.update_info:
+            upd = [pystray.MenuItem(f"새 버전 v{self.update_info[0]} 설치…",
+                                    lambda i, it: self.q.put(("update",)))]
         return pystray.Menu(
             *self._menu_lines(),
             pystray.Menu.SEPARATOR,
+            *upd,
             pystray.MenuItem("지금 새로고침", lambda i, it: self.q.put(("refresh",))),
             pystray.MenuItem("장수 토큰 등록 (클립보드에서)",
                              lambda i, it: self.q.put(("token",)),
@@ -1068,6 +1229,7 @@ class TrayApp:
             pystray.MenuItem("Windows 시작 시 자동 실행",
                              lambda i, it: self.q.put(("startup",)),
                              checked=lambda it: startup_installed()),
+            pystray.MenuItem("패치 이력 보기", lambda i, it: self.q.put(("notes",))),
             pystray.MenuItem("로그 폴더 열기", lambda i, it: self.q.put(("log",))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", lambda i, it: self.q.put(("quit",))),
@@ -1157,6 +1319,11 @@ class TrayApp:
             elif kind == "startup":
                 uninstall_startup() if startup_installed() else install_startup()
                 self._refresh_tray()
+            elif kind == "update":
+                threading.Thread(target=self._do_update, daemon=True).start()
+            elif kind == "notes":
+                import webbrowser
+                webbrowser.open(CHANGELOG_PAGE)
             elif kind == "log":
                 os.startfile(APPDATA_DIR)
             elif kind == "quit":
@@ -1216,7 +1383,8 @@ def main():
     threading.excepthook = lambda a: log.error(
         "thread crashed", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
     acquire_singleton()
-    log.info("---- tray v2 start (python %s) ----", sys.version.split()[0])
+    log.info("---- tray v%s start (python %s) ----",
+             __version__, sys.version.split()[0])
     TrayApp().run()
 
 
