@@ -34,7 +34,10 @@ API_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS = {"User-Agent": CLI_UA, "anthropic-beta": "oauth-2025-04-20"}
 
 POLL_SEC = 5
-API_INTERVAL_OK = 60
+API_INTERVAL_ACTIVE = 60        # 대화 중일 때의 기본 조회 간격
+API_INTERVAL_IDLE = 600         # 유휴일 때 — 서버 호출 한도를 아낀다
+ACTIVE_WINDOW = 300             # 최근 5분 내 전사 갱신 = 대화 중
+EVENT_MIN_GAP = 90              # 답변 직후 조회의 최소 간격
 API_INTERVAL_DENIED = 30 * 60
 SINGLETON_PORT = 53917
 
@@ -213,6 +216,20 @@ class ApiDenied(Exception):
     pass
 
 
+class ApiThrottled(Exception):
+    """HTTP 429 — 사용량 엔드포인트의 자체 호출 제한에 걸림."""
+    def __init__(self, retry_after=None):
+        super().__init__("HTTP 429")
+        self.retry_after = retry_after
+
+
+def _retry_after(e):
+    try:
+        return float(e.headers.get("Retry-After")) if e.headers else None
+    except (TypeError, ValueError):
+        return None
+
+
 _refresh_lock = threading.Lock()
 _tok_sig = None
 
@@ -298,6 +315,8 @@ def fetch_usage_api():
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 raise ApiDenied("설정 토큰 거부 — claude setup-token 재발급 필요")
+            if e.code == 429:
+                raise ApiThrottled(_retry_after(e))
             raise RuntimeError(f"HTTP {e.code}")
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
@@ -318,6 +337,8 @@ def fetch_usage_api():
                 pass
             if e.code in (401, 403):
                 raise ApiDenied(f"HTTP {e.code} {body[:120]}")
+            if e.code == 429:
+                raise ApiThrottled(_retry_after(e))
             raise RuntimeError(f"HTTP {e.code}")
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
@@ -415,6 +436,45 @@ class _PE32W(ctypes.Structure):
                 ("pcPriClassBase", ctypes.c_long),
                 ("dwFlags", ctypes.c_ulong),
                 ("szExeFile", ctypes.c_wchar * 260)]
+
+
+TRANSCRIPT_DIR = os.path.join(HOME, ".claude", "projects")
+_ts_cache = {"path": None, "scan_at": 0.0}
+
+
+def latest_transcript_mtime():
+    """가장 최근 대화 전사(.jsonl)의 mtime — Claude가 방금 답했는지의 신호.
+
+    Stop 훅은 환경에 따라 안 불리기도 하지만, 전사 파일은 데스크톱·터미널
+    어디서든 답변마다 갱신되므로 더 믿을 만한 활동 감지 수단이다.
+    전체 스캔은 수천 파일에 80ms쯤 걸리므로 60초에 1번만 하고,
+    평소에는 마지막으로 찾아둔 파일 하나만 stat 한다 (진행 중 대화의
+    이어쓰기는 그 파일에서 바로 잡힌다).
+    """
+    now = time.time()
+    best_path, best_m = _ts_cache["path"], 0.0
+    if best_path:
+        try:
+            best_m = os.path.getmtime(best_path)
+        except OSError:
+            best_path = None
+    if best_path is None or now - _ts_cache["scan_at"] >= 60:
+        _ts_cache["scan_at"] = now
+        try:
+            for root, dirs, files in os.walk(TRANSCRIPT_DIR):
+                for f in files:
+                    if f.endswith(".jsonl"):
+                        p = os.path.join(root, f)
+                        try:
+                            m = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        if m > best_m:
+                            best_m, best_path = m, p
+        except OSError:
+            pass
+        _ts_cache["path"] = best_path
+    return best_m
 
 
 def claude_running():
@@ -839,6 +899,10 @@ class TrayApp:
         last_mtime = None
         last_cred = None
         next_api = 0.0
+        throttle_until = 0.0
+        throttle_streak = 0
+        last_ts = None
+        last_attempt = 0.0
         api_denied_reason = None
         api_ok = False
         claude_gone_at = None
@@ -866,7 +930,20 @@ class TrayApp:
                     last_cred = cred
                     next_api = 0.0
                     log.info("credentials changed - retry api now")
+
+                # 전사 파일 갱신 = 방금 답변이 끝남 → 사용량이 변한 순간
+                ts_m = latest_transcript_mtime()
+                active = bool(ts_m) and (now - ts_m) < ACTIVE_WINDOW
+                if last_ts is None:
+                    last_ts = ts_m
+                elif ts_m != last_ts:
+                    last_ts = ts_m
+                    if now >= throttle_until and \
+                            now - last_attempt >= EVENT_MIN_GAP:
+                        next_api = min(next_api, now)
+
                 if now >= next_api:
+                    last_attempt = now
                     try:
                         data = fetch_usage_api()
                         rows = rows_from_limits(data.get("limits")) \
@@ -874,6 +951,8 @@ class TrayApp:
                         if rows:
                             self.q.put(("data", rows, "api", now))
                             api_denied_reason = None
+                            throttle_streak = 0
+                            throttle_until = 0.0
                             if self.auth_notice:
                                 self.auth_notice = None
                                 log.info("auth notice cleared")
@@ -882,7 +961,21 @@ class TrayApp:
                                 log.info("api ok: %d rows", len(rows))
                             if not self.cfg.get("setup_token"):
                                 self._adopt_setup_token()
-                        next_api = now + API_INTERVAL_OK
+                        next_api = now + (API_INTERVAL_ACTIVE if active
+                                          else API_INTERVAL_IDLE)
+                    except ApiThrottled as e:
+                        api_ok = False
+                        throttle_streak += 1
+                        if e.retry_after:
+                            wait = min(e.retry_after, 600)
+                        else:
+                            # 짧은 스로틀은 30초 재시도로 즉시 회복하고,
+                            # 오래 가는 스로틀은 한도를 더 갉지 않게 점점 늦춘다.
+                            wait = min(30 * 2 ** ((throttle_streak - 1) // 4), 300)
+                        throttle_until = now + wait if throttle_streak > 4 else 0.0
+                        next_api = now + wait
+                        log.info("api throttled (429) x%d - retry in %ds",
+                                 throttle_streak, int(wait))
                     except ApiDenied as e:
                         api_denied_reason = str(e)
                         api_ok = False
@@ -901,7 +994,7 @@ class TrayApp:
                         # 조직 정책 등 재발급으로 못 푸는 경우는 문구 없음
                     except Exception as e:
                         api_ok = False
-                        next_api = now + API_INTERVAL_OK
+                        next_api = now + API_INTERVAL_ACTIVE
                         log.warning("api error: %s", e)
 
                 try:
@@ -909,10 +1002,14 @@ class TrayApp:
                 except OSError:
                     mtime = None
                 if mtime and mtime != last_mtime:
+                    first = last_mtime is None
                     last_mtime = mtime
                     got = self._load_file()
                     if got:
                         self.q.put(("data", got[0], "hook", got[1]))
+                    if not first and now >= throttle_until:
+                        # 답변 직후 = 사용량이 막 변한 시점, 즉시 재조회
+                        next_api = min(next_api, now)
 
                 if not self.rows:
                     if api_denied_reason and "설정 토큰" in api_denied_reason:
