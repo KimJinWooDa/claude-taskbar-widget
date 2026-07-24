@@ -24,7 +24,7 @@ import datetime
 import urllib.request
 import urllib.error
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 APP_NAME = "ClaudeUsageWidget"
 HOME = os.path.expanduser("~")
@@ -242,9 +242,11 @@ def _retry_after(e):
 
 _refresh_lock = threading.Lock()
 _tok_sig = None
+_mem_oauth = {}     # 마지막 갱신 결과 — 파일 쓰기가 실패해도 체인이 안 끊기게
 
 
 def get_access_token(force_refresh=False):
+    global _mem_oauth
     with _refresh_lock:
         try:
             with open(CRED_PATH, encoding="utf-8") as f:
@@ -252,6 +254,8 @@ def get_access_token(force_refresh=False):
         except (OSError, json.JSONDecodeError) as e:
             raise ApiDenied(f"인증 파일 없음: {e}")
         oauth = creds.get("claudeAiOauth") or {}
+        if _mem_oauth.get("expiresAt", 0) > (oauth.get("expiresAt") or 0):
+            oauth = {**oauth, **_mem_oauth}
         token = oauth.get("accessToken")
         global _tok_sig
         sig = ((token or "")[:11], oauth.get("expiresAt"))
@@ -287,35 +291,57 @@ def get_access_token(force_refresh=False):
                 body = e.read().decode()[:300]
             except Exception:
                 pass
-            log.info("token refresh body: %s", body)
+            log.info("token refresh HTTP %d: %s", e.code, body)
+            # 리프레시 토큰은 1회용 — 내 갱신이 실패했다면 CLI 등 다른
+            # 클라이언트가 먼저 회전시켰을 수 있으니 파일을 다시 읽어본다.
+            try:
+                with open(CRED_PATH, encoding="utf-8") as f:
+                    o2 = json.load(f).get("claudeAiOauth") or {}
+                t2 = o2.get("accessToken")
+                if t2 and t2 != token and \
+                        (o2.get("expiresAt") or 0) > time.time() * 1000 + 60_000:
+                    log.info("credentials rotated by another client - adopting")
+                    return t2
+            except (OSError, json.JSONDecodeError):
+                pass
             if token and not force_refresh:
                 log.info("refresh failed - trying stored token anyway")
-                return token    # 만료 표기가 틀린 장수 토큰일 수 있다
+                return token
             raise ApiDenied(f"토큰 갱신 실패 HTTP {e.code}")
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
+        _mem_oauth = {
+            "accessToken": t["access_token"],
+            "refreshToken": t.get("refresh_token") or rt,
+            "expiresAt": int(time.time() * 1000)
+                         + int(t.get("expires_in", 3600)) * 1000,
+        }
+        creds = {}
         try:
             with open(CRED_PATH, encoding="utf-8") as f:
                 creds = json.load(f)
         except (OSError, json.JSONDecodeError):
             pass
-        o = creds.setdefault("claudeAiOauth", {})
-        o["accessToken"] = t["access_token"]
-        if t.get("refresh_token"):
-            o["refreshToken"] = t["refresh_token"]
-        o["expiresAt"] = int(time.time() * 1000) + int(t.get("expires_in", 3600)) * 1000
-        tmp = CRED_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(creds, f)
-        os.replace(tmp, CRED_PATH)
+        creds.setdefault("claudeAiOauth", {}).update(_mem_oauth)
+        try:
+            tmp = CRED_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(creds, f)
+            os.replace(tmp, CRED_PATH)
+        except OSError as e:
+            # 디스크 반영은 실패해도 _mem_oauth가 새 체인을 들고 있다
+            log.warning("credential write failed (%s) - token kept in memory", e)
         log.info("token refreshed")
         return t["access_token"]
 
 
-def fetch_usage_api():
-    # 장수 토큰(claude setup-token, 12개월)이 등록돼 있으면 그것만 쓴다 —
-    # 갱신이 필요 없어 .credentials.json의 1회용 리프레시 토큰 문제를 피한다.
-    setup_tok = load_config().get("setup_token")
+def fetch_usage_api(cfg=None):
+    # 장수 토큰(claude setup-token)이 등록돼 있으면 우선 쓰되, 401로 죽은
+    # 토큰이면 그 자리에서 폐기하고 아래 리프레시 경로로 넘어간다 —
+    # 매 폴마다 죽은 토큰을 두드리면 헛 호출로 429만 부른다.
+    if cfg is None:
+        cfg = load_config()
+    setup_tok = cfg.get("setup_token")
     if setup_tok:
         req = urllib.request.Request(
             API_URL, headers={"Authorization": f"Bearer {setup_tok}", **API_HEADERS})
@@ -323,11 +349,17 @@ def fetch_usage_api():
             with urllib.request.urlopen(req, timeout=20) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise ApiDenied("설정 토큰 거부 — claude setup-token 재발급 필요")
-            if e.code == 429:
+            if e.code == 401:
+                cfg.pop("setup_token", None)
+                save_config(cfg)
+                log.info("setup token dead (HTTP 401) - dropped, "
+                         "falling back to refresh path")
+            elif e.code == 403:
+                raise ApiDenied("설정 토큰 거부 HTTP 403")
+            elif e.code == 429:
                 raise ApiThrottled(_retry_after(e))
-            raise RuntimeError(f"HTTP {e.code}")
+            else:
+                raise RuntimeError(f"HTTP {e.code}")
         except OSError as e:
             raise RuntimeError(f"네트워크: {e}")
     for attempt in (0, 1):
@@ -559,11 +591,49 @@ def claude_running():
 
 
 # ---------------------------------------------------------------- 플로팅 바
+SNIP_EXES = {
+    # 화면 캡처 도구의 전체화면 오버레이 — 가림으로 치지 않는다 (바가 안 숨음)
+    "screenclippinghost.exe", "snippingtool.exe", "screensketch.exe",
+    "sharex.exe", "picpick.exe", "snagit32.exe", "snagitcapture.exe",
+    "flameshot.exe", "greenshot.exe", "lightshot.exe",
+    "kakaotalk.exe", "alcapture.exe", "alsee.exe", "bandicam.exe",
+    "snipaste.exe", "pixpin.exe",
+}
+_last_cover_exe = None
+
+
+def _window_exe(hwnd):
+    """창을 소유한 프로세스의 실행파일 이름(소문자) — 실패 시 ''."""
+    try:
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        pid = ctypes.wintypes.DWORD()
+        u.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x1000, False, pid.value)   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            n = ctypes.wintypes.DWORD(512)
+            if k.QueryFullProcessImageNameW(ctypes.c_void_p(h), 0, buf,
+                                            ctypes.byref(n)):
+                return os.path.basename(buf.value).lower()
+        finally:
+            k.CloseHandle(ctypes.c_void_p(h))
+    except Exception:
+        pass
+    return ""
+
+
 def _taskbar_covered():
-    """작업표시줄이 전체화면 앱에 가려졌으면 True — 바를 잠시 숨긴다.
+    """(가려짐, 캡처오버레이) — 작업표시줄이 전체화면 앱에 덮였는지 판정.
 
     전면 창 좌표 비교는 테두리 없는 최대화 창(Electron 앱 등)을 오탐하므로,
     작업표시줄 중앙 픽셀을 실제로 차지한 창이 무엇인지로 판정한다.
+    캡처 도구의 오버레이(Win+Shift+S 등)는 가림으로 치지 않되, 화면이
+    어두워진 동안 배경을 잘못 찍지 않게 둘째 값으로 알려준다.
     """
     try:
         u = ctypes.windll.user32
@@ -573,22 +643,34 @@ def _taskbar_covered():
         u.GetAncestor.restype = ctypes.c_void_p
         tray = u.FindWindowW("Shell_TrayWnd", None)
         if not tray or not u.IsWindowVisible(ctypes.c_void_p(tray)):
-            return True
+            return True, False
         r = ctypes.wintypes.RECT()
         u.GetWindowRect(ctypes.c_void_p(tray), ctypes.byref(r))
         pt = ctypes.wintypes.POINT((r.left + r.right) // 2,
                                    (r.top + r.bottom) // 2)
-        h = u.WindowFromPoint(pt)
-        h = u.GetAncestor(ctypes.c_void_p(h), 2) if h else None
+        h0 = u.WindowFromPoint(pt)
+        h = u.GetAncestor(ctypes.c_void_p(h0), 2) if h0 else None
         if not h or h == tray:
-            return False
+            return False, False
         hr = ctypes.wintypes.RECT()
         u.GetWindowRect(ctypes.c_void_p(h), ctypes.byref(hr))
         if (hr.right - hr.left) < u.GetSystemMetrics(0) * 3 // 5:
-            return False        # 툴팁·플라이아웃 같은 작은 창은 가림으로 안 침
-        return hr.top < r.top - 4
+            return False, False     # 툴팁·플라이아웃 같은 작은 창
+        # UWP 캡처 오버레이는 최상위가 ApplicationFrameHost일 수 있어
+        # 직계 창의 프로세스도 함께 본다
+        exes = {_window_exe(h), _window_exe(h0)} - {""}
+        if exes & SNIP_EXES:
+            return False, True
+        covered = hr.top < r.top - 4
+        global _last_cover_exe
+        if covered and exes != _last_cover_exe:
+            _last_cover_exe = exes
+            log.info("taskbar covered by %s", "/".join(sorted(exes)) or "?")
+        elif not covered:
+            _last_cover_exe = None
+        return covered, False
     except Exception:
-        return False
+        return False, False
 
 
 class FloatingBar(threading.Thread):
@@ -631,6 +713,8 @@ class FloatingBar(threading.Thread):
         self._covered = 0
         self._ticks = 0
         self._rgb = None
+        self._pending = None
+        self._snip_active = False
         self._pal = self.PAL_DARK
         self._bgimg = None
         self._last = [None, None]
@@ -701,12 +785,23 @@ class FloatingBar(threading.Thread):
         단색이 아니라 실제 조각(미카 그라데이션 포함)을 입히므로 경계가 없다.
         캡처하려면 바를 잠깐 숨겨야 해서, 옆 픽셀이 실제로 달라졌을 때만 다시 찍는다.
         """
+        if not force and self._snip_active:
+            return      # 캡처 오버레이로 어두워진 화면을 배경으로 찍으면 안 됨
         rgb = self._probe()
         if rgb is None:
             return
-        if not force and self._rgb and \
-                max(abs(a - b) for a, b in zip(rgb, self._rgb)) <= 3:
-            return
+        if not force:
+            if self._rgb and \
+                    max(abs(a - b) for a, b in zip(rgb, self._rgb)) <= 3:
+                self._pending = None
+                return
+            # 새 색이 2회 연속(약 60초) 유지될 때만 재촬영 —
+            # 아이콘 점멸·알림 토스트 같은 일시 변화로 깜빡이지 않게
+            if self._pending is None or \
+                    max(abs(a - b) for a, b in zip(rgb, self._pending)) > 3:
+                self._pending = rgb
+                return
+            self._pending = None
         self._rgb = rgb
         was_shown = self._shown
         try:
@@ -825,7 +920,8 @@ class FloatingBar(threading.Thread):
         if not self.app.cfg.get("bar_visible", True):
             self._show(False)
             return
-        self._covered = self._covered + 1 if _taskbar_covered() else 0
+        covered, self._snip_active = _taskbar_covered()
+        self._covered = self._covered + 1 if covered else 0
         if self._covered >= 2:      # 순간 오탐으로 깜빡이지 않게 2회 연속일 때만
             self._show(False)
             return
@@ -932,18 +1028,21 @@ class TrayApp:
             self.status = None
 
     def _adopt_setup_token(self):
-        """credentials에 장수 토큰(sk-ant-oat…)이 보이면 위젯 설정에 자동 등록.
+        """credentials에 진짜 장수 토큰이 보일 때만 위젯 설정에 자동 등록.
 
-        claude setup-token이 토큰을 화면에 안 보여주고 파일에만 저장하므로,
-        수동 복사 없이 위젯이 스스로 집어간다. 등록 후엔 갱신이 필요 없다.
+        sk-ant-oat 접두사는 8시간짜리 일반 액세스 토큰도 똑같이 쓴다
+        (2026-07-24 실측 — 접두사만 보고 채택한 토큰이 8시간마다 죽었음).
+        만료가 30일 이상 남은 것만 장수 토큰으로 인정한다.
         """
         try:
             with open(CRED_PATH, encoding="utf-8") as f:
-                tok = ((json.load(f).get("claudeAiOauth") or {})
-                       .get("accessToken")) or ""
+                o = json.load(f).get("claudeAiOauth") or {}
         except (OSError, json.JSONDecodeError):
             return False
-        if tok.startswith("sk-ant-oat") and tok != self.cfg.get("setup_token"):
+        tok = o.get("accessToken") or ""
+        far = (time.time() + 30 * 86400) * 1000
+        if tok.startswith("sk-ant-oat") and (o.get("expiresAt") or 0) > far \
+                and tok != self.cfg.get("setup_token"):
             self.cfg["setup_token"] = tok
             save_config(self.cfg)
             log.info("setup token auto-registered (len %d)", len(tok))
@@ -1094,14 +1193,16 @@ class TrayApp:
                     last_ts = ts_m
                 elif ts_m != last_ts:
                     last_ts = ts_m
-                    if now >= throttle_until and \
+                    # 인증이 죽은 상태의 이벤트 재시도는 헛 호출만 쌓는다 —
+                    # 재로그인은 credentials 변경 감지가 즉시 잡는다
+                    if now >= throttle_until and not api_denied_reason and \
                             now - last_attempt >= EVENT_MIN_GAP:
                         next_api = min(next_api, now)
 
                 if now >= next_api:
                     last_attempt = now
                     try:
-                        data = fetch_usage_api()
+                        data = fetch_usage_api(self.cfg)
                         rows = rows_from_limits(data.get("limits")) \
                             or rows_from_windows(data)
                         if rows:
@@ -1123,12 +1224,16 @@ class TrayApp:
                         api_ok = False
                         throttle_streak += 1
                         if e.retry_after:
+                            # 서버가 명시한 대기는 이벤트 재시도도 존중 —
+                            # 그 전에 찌르면 잠금 창만 계속 연장된다
                             wait = min(e.retry_after, 600)
+                            throttle_until = now + wait
                         else:
                             # 짧은 스로틀은 30초 재시도로 즉시 회복하고,
                             # 오래 가는 스로틀은 한도를 더 갉지 않게 점점 늦춘다.
                             wait = min(30 * 2 ** ((throttle_streak - 1) // 4), 300)
-                        throttle_until = now + wait if throttle_streak > 4 else 0.0
+                            throttle_until = now + wait if throttle_streak > 4 \
+                                else 0.0
                         next_api = now + wait
                         log.info("api throttled (429) x%d - retry in %ds",
                                  throttle_streak, int(wait))
@@ -1140,14 +1245,15 @@ class TrayApp:
                         if "설정 토큰" in api_denied_reason and \
                                 self._adopt_setup_token():
                             next_api = 0.0  # 새로 발급된 장수 토큰으로 즉시 재시도
-                        elif ("설정 토큰" in api_denied_reason
-                              or "토큰 갱신" in api_denied_reason
+                        elif ("토큰 갱신" in api_denied_reason
+                              or "리프레시 토큰" in api_denied_reason
                               or "인증" in api_denied_reason):
-                            n = "토큰 만료 · claude setup-token 실행"
+                            # 리프레시 체인까지 끊긴 상태 — 재로그인만이 답
+                            n = "재로그인 필요 · claude /login"
                             if n != self.auth_notice:
                                 self.auth_notice = n
                                 log.info("auth notice: %s", n)
-                        # 조직 정책 등 재발급으로 못 푸는 경우는 문구 없음
+                        # 조직 정책(403) 등 재로그인으로 못 푸는 경우는 문구 없음
                     except Exception as e:
                         api_ok = False
                         next_api = now + API_INTERVAL_ACTIVE
@@ -1163,14 +1269,17 @@ class TrayApp:
                     got = self._load_file()
                     if got:
                         self.q.put(("data", got[0], "hook", got[1]))
-                    if not first and now >= throttle_until:
+                    if not first and now >= throttle_until \
+                            and not api_denied_reason:
                         # 답변 직후 = 사용량이 막 변한 시점, 즉시 재조회
                         next_api = min(next_api, now)
 
                 if not self.rows:
                     if api_denied_reason and "설정 토큰" in api_denied_reason:
-                        st = "설정 토큰 재발급 필요 — claude setup-token"
-                    elif api_denied_reason and "토큰 갱신" in api_denied_reason:
+                        st = "설정 토큰 거부(403) — 조직 설정 확인"
+                    elif api_denied_reason and ("토큰 갱신" in api_denied_reason
+                                                or "리프레시 토큰" in api_denied_reason
+                                                or "인증" in api_denied_reason):
                         st = "재로그인 필요 — 터미널에서 claude /login"
                     elif api_denied_reason:
                         st = "대기 중 — 훅 설정 확인 필요"
